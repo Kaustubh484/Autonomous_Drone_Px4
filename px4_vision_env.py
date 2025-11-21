@@ -53,7 +53,7 @@ class PX4VisionEnv(gym.Env):
         self.max_yaw_rate = 15.0
         self.min_thrust = 0.50       
         self.max_thrust = 0.80
-        
+        self.last_action = np.zeros(4, dtype=np.float32)
         # Reward parameters
         self.waypoint_threshold = 1.5
         self.collision_threshold = 0.4  # Higher threshold to detect ground sooner
@@ -406,6 +406,10 @@ class PX4VisionEnv(gym.Env):
         action_mag = np.linalg.norm(action)
         reward -= action_mag * ACTION_COEFF
 
+        action_smoothness = np.linalg.norm(action - self.last_action)
+        reward -= action_smoothness * 0.5
+        self.last_action = action.copy()
+
         # 5. Waypoint Reached (Sparse Bonus)
         if current_distance < self.waypoint_threshold:
             reward += 100.0
@@ -473,9 +477,9 @@ class PX4VisionEnv(gym.Env):
         self.is_connected = False
         await self._connect_drone()
         if not self.is_connected: raise ConnectionError("Reconnect failed")
-        if os.path.exists("create_test_waypoints.py"):
+        if os.path.exists("level_1_waypoints.py"):
             await asyncio.sleep(10)
-            subprocess.run("python3 create_test_waypoints.py", shell=True)
+            subprocess.run("python3 level_1_waypoints.py", shell=True)
             try: self.waypoints = np.load('waypoints.npy')
             except: pass
         print("✓ Auto-Heal Complete\n")

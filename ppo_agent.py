@@ -204,6 +204,33 @@ class RolloutBuffer:
         self.full = False
 
 
+class RunningMeanStd:
+    def __init__(self, shape):
+        self.mean = np.zeros(shape, 'float64')
+        self.var = np.ones(shape, 'float64')
+        self.count = 1e-4
+
+    def update(self, x):
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+        
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+        
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+
 class PPO:
     """
     Proximal Policy Optimization (PPO) agent.
@@ -227,7 +254,7 @@ class PPO:
         device='cuda'
     ):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        
+        self.obs_normalizer = RunningMeanStd(shape=(obs_dim,))
         # Hyperparameters
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -247,28 +274,42 @@ class PPO:
         
         # Training stats
         self.n_updates = 0
+
+    def _normalize_obs(self, obs, update=False):
+        """Helper to normalize observations"""
+        if update:
+            self.obs_normalizer.update(obs)
+        
+        # Normalize: (x - mean) / std
+        mean = torch.FloatTensor(self.obs_normalizer.mean).to(self.device)
+        std = torch.sqrt(torch.FloatTensor(self.obs_normalizer.var)).to(self.device)
+        
+        if isinstance(obs, torch.Tensor):
+            return (obs - mean) / (std + 1e-8)
+        else:
+            obs_tensor = torch.FloatTensor(obs).to(self.device)
+            return (obs_tensor - mean) / (std + 1e-8)
     
     def select_action(self, obs, deterministic=False):
-        """
-        Select action from policy.
+        """Select action from policy."""
+        # NEW: Update stats and normalize observation
+        # We update stats only when NOT deterministic (implies training)
+        obs_norm = self._normalize_obs(obs, update=not deterministic)
         
-        Args:
-            obs: Observation (numpy array)
-            deterministic: If True, return mean action
-        
-        Returns:
-            action (numpy), log_prob, value
-        """
-        obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-        
+        # Need to unsqueeze if it's a single observation
+        if obs_norm.ndim == 1:
+            obs_norm = obs_norm.unsqueeze(0)
+            
         with torch.no_grad():
-            action, log_prob, value = self.policy.get_action(obs_tensor, deterministic)
+            action, log_prob, value = self.policy.get_action(obs_norm, deterministic)
         
         return (
             action.cpu().numpy()[0],
             log_prob.cpu().item() if log_prob is not None else None,
             value.cpu().item()
         )
+    
+    
     
     def compute_gae(self, rewards, values, dones):
         """Compute Generalized Advantage Estimation"""
@@ -300,6 +341,7 @@ class PPO:
         dones = data['dones']
         values = data['values']
         
+        obs = self._normalize_obs(obs, update=False)
         # Compute advantages
         advantages, returns = self.compute_gae(rewards, values, dones)
         
@@ -375,19 +417,30 @@ class PPO:
         }
     
     def save(self, path):
-        """Save model"""
+        """Save model AND normalizer stats"""
         torch.save({
             'policy_state_dict': self.policy.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'n_updates': self.n_updates
+            'n_updates': self.n_updates,
+            # NEW: Save normalizer
+            'obs_mean': self.obs_normalizer.mean,
+            'obs_var': self.obs_normalizer.var,
+            'obs_count': self.obs_normalizer.count
         }, path)
     
     def load(self, path):
-        """Load model"""
+        """Load model AND normalizer stats"""
         checkpoint = torch.load(path, map_location=self.device)
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.n_updates = checkpoint['n_updates']
+        
+        # NEW: Load normalizer
+        if 'obs_mean' in checkpoint:
+            self.obs_normalizer.mean = checkpoint['obs_mean']
+            self.obs_normalizer.var = checkpoint['obs_var']
+            self.obs_normalizer.count = checkpoint['obs_count']
+            print("✓ Loaded observation normalizer stats")
 
 
 # For testing
